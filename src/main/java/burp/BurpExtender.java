@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.List;
 
 public class BurpExtender implements IBurpExtender, IScannerCheck {
+    private String extensionName = "Cypher Injection Scanner";
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
     private IBurpCollaboratorClientContext collaborator;
@@ -20,7 +21,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
         // stdout = new PrintWriter(callbacks.getStdout(), true);
         
         helpers = callbacks.getHelpers();
-        callbacks.setExtensionName("Cypher Injection Scanner");
+        callbacks.setExtensionName(extensionName);
         
         collaborator = callbacks.createBurpCollaboratorClientContext();
         payloadCollaborator = collaborator.generatePayload(true);
@@ -151,6 +152,35 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
         return requestHighlight;
     }
 
+    /** called by a thread to analyze if collaborator has received requests from payloads */
+    public synchronized void verifyCollaborator(IHttpRequestResponse baseRequestResponse, IScannerInsertionPoint insertionPoint, HashMap<String, String> payloads, HashMap<String, Object[]> requests) {
+        //wait for DNS querys
+        try {Thread.sleep(10000); } catch (Exception e) {}
+        
+        //gets burp collaborator interactions
+        List<String> dnsQuerys = getDNSQuerys();
+        boolean foundInjection = false;
+        if (dnsQuerys.size() > 0) {
+            for (String query : dnsQuerys) {
+                if (foundInjection) // to avoid repeat issue in the same point
+                    break;
+                for (String hash : payloads.keySet()) {
+                    List<int[]> queryMatches = getMatches(query.getBytes(), hash.getBytes());
+                    //if find the request that generated the received hash 
+                    if (queryMatches.size() > 0) { 
+                        IHttpRequestResponse mRequest = (IHttpRequestResponse) requests.get(hash)[0];
+                        String payload = (String) requests.get(hash)[1];
+                        int[] requestHighlight = getHighlights(insertionPoint, payload);
+                        IScanIssue issue = new CypherInjectionIssue(baseRequestResponse, mRequest, helpers, Arrays.asList(requestHighlight), callbacks, payload, insertionPoint.getInsertionPointName());
+                        foundInjection = true;
+                        callbacks.addScanIssue(issue);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
     @Override
     public List<IScanIssue> doActiveScan(IHttpRequestResponse baseRequestResponse, IScannerInsertionPoint insertionPoint) {
         
@@ -189,27 +219,13 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
             }
         }
 
-        //wait dns querys arrive
-        try {Thread.sleep(2000); } catch (Exception e) {}
-        //show if collaborator has received requests
-        List<String> dnsQuerys = getDNSQuerys();
-        if (dnsQuerys.size() > 0) {
-            for (String query : dnsQuerys) {
-                if (issues.size() < 2) // to avoid repeat issue in the same point
-                    for (String hash : payloads.keySet()) {
-                        List<int[]> queryMatches = getMatches(query.getBytes(), hash.getBytes());
-                        //if find the request that generated the received hash 
-                        if (queryMatches.size() > 0) { 
-                            IHttpRequestResponse mRequest = (IHttpRequestResponse) requests.get(hash)[0];
-                            String payload = (String) requests.get(hash)[1];
-                            int[] requestHighlight = getHighlights(insertionPoint, payload);
-                            IScanIssue issue = new CypherInjectionIssue(baseRequestResponse, mRequest, helpers, Arrays.asList(requestHighlight), callbacks, payload, insertionPoint.getInsertionPointName());
-                            issues.add(issue);
-                            break;
-                        }
-                    }
+        //analyze if any payload worked
+        new Thread(new Runnable() {
+            public void run() {
+                verifyCollaborator(baseRequestResponse, insertionPoint, payloads, requests);
             }
-        }
+        }).start();
+
         return (issues.size() > 0) ? issues : null;
     }
 
