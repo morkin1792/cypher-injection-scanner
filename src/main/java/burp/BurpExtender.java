@@ -204,21 +204,18 @@ class Monitor implements Runnable, IExtensionStateListener {
     private PrintWriter stdout;
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
-    private HashMap<String, String> payloads;
-    private HashMap<String, Object[]> requests;
-    private List<String> dnsQuerys;
+    private List<Object[]> requestsPayloads;
     private IBurpCollaboratorClientContext collaborator;
     private String urlCollaborator;
     private Lock lock;
+    private final int aliveTime = 5000;
 
     public Monitor(PrintWriter stdout, IBurpExtenderCallbacks callbacks) {
         this.stdout = stdout;
         this.callbacks = callbacks;
         this.helpers = callbacks.getHelpers();
-        this.payloads = new HashMap<String, String>();
-        this.requests = new HashMap<String, Object[]>();
-        this.dnsQuerys = new ArrayList<>();
-        stop = false;        
+        stop = false;
+        requestsPayloads = new ArrayList<>();
         collaborator = callbacks.createBurpCollaboratorClientContext();
         urlCollaborator = collaborator.generatePayload(true);
         lock = new ReentrantLock();
@@ -239,8 +236,7 @@ class Monitor implements Runnable, IExtensionStateListener {
         while (notAdd) {
             if(lock.tryLock()) {
                 try {
-                    this.payloads.putAll(payloads);
-                    this.requests.putAll(requests);
+                    this.requestsPayloads.add(new Object[]{payloads,requests, System.currentTimeMillis()});
                 } finally {
                     lock.unlock();
                     notAdd = false;
@@ -252,7 +248,7 @@ class Monitor implements Runnable, IExtensionStateListener {
     public void run() {
         try {
             while (!stop) {
-                Thread.sleep(10000);
+                Thread.sleep(aliveTime*2);
                 verify();
             }
         } catch (Exception e) {
@@ -279,27 +275,37 @@ class Monitor implements Runnable, IExtensionStateListener {
         if (lock.tryLock()) {
             try {
                 // stdout.println("getDNSQuerys");
-                dnsQuerys = getDNSQuerys();
-                boolean foundInjection = false;
+                List<String> dnsQuerys = getDNSQuerys();
                 for (String query : dnsQuerys) {
-                    if (foundInjection) // to avoid repeat issue in the same point
-                        break;
-                    for (String hash : payloads.keySet()) {
-                        List<int[]> queryMatches = BurpExtender.getMatches(helpers, query.getBytes(), hash.getBytes());
-                        //if find the request that generated the received hash 
-                        if (queryMatches.size() > 0) { 
-                            IHttpRequestResponse mRequest = (IHttpRequestResponse) requests.get(hash)[0];
-                            String payload = (String) requests.get(hash)[1];
-                            IScannerInsertionPoint insertionPoint = (IScannerInsertionPoint) requests.get(hash)[2];
-                            IHttpRequestResponse baseRequestResponse = (IHttpRequestResponse) requests.get(hash)[3];
-                            int[] requestHighlight = BurpExtender.getHighlights(insertionPoint, payload);
-                            IScanIssue issue = new CypherInjectionIssue(baseRequestResponse, mRequest, helpers, Arrays.asList(requestHighlight), callbacks, payload, insertionPoint.getInsertionPointName());
-                            foundInjection = true;
-                            callbacks.addScanIssue(issue);
-                            break;
+                    
+                    for (Object[] rp : this.requestsPayloads) {
+                        HashMap<String, String> payloads = (HashMap<String,String>) rp[0];
+                        HashMap<String, Object[]> requests = (HashMap<String,Object[]>) rp[1];
+        
+                        for (String hash : payloads.keySet()) {
+                            List<int[]> queryMatches = BurpExtender.getMatches(helpers, query.getBytes(), hash.getBytes());
+                            //if find the request that generated the received hash 
+                            if (queryMatches.size() > 0) { 
+                                IHttpRequestResponse mRequest = (IHttpRequestResponse) requests.get(hash)[0];
+                                String payload = (String) requests.get(hash)[1];
+                                IScannerInsertionPoint insertionPoint = (IScannerInsertionPoint) requests.get(hash)[2];
+                                IHttpRequestResponse baseRequestResponse = (IHttpRequestResponse) requests.get(hash)[3];
+                                int[] requestHighlight = BurpExtender.getHighlights(insertionPoint, payload);
+                                IScanIssue issue = new CypherInjectionIssue(baseRequestResponse, mRequest, helpers, Arrays.asList(requestHighlight), callbacks, payload, insertionPoint.getInsertionPointName());
+                                callbacks.addScanIssue(issue);
+                                rp[2] = (long)0; //found payload then mark to remove this element from requestsPayloads
+                            }
                         }
                     }
-                }    
+                }
+                //removing payloads 
+                for (int i=0; i<this.requestsPayloads.size(); i++) {
+                    long age = (long) requestsPayloads.get(i)[2];
+                    if ((System.currentTimeMillis() - age) > aliveTime) {
+                        requestsPayloads.remove(i);
+                        i--;
+                    }
+                }
             } finally {
                 lock.unlock();
             }
