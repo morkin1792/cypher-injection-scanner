@@ -275,6 +275,7 @@ class Monitor implements Runnable, IExtensionStateListener {
         if (lock.tryLock()) {
             try {
                 // stdout.println("getDNSQuerys");
+                long time = System.currentTimeMillis();
                 List<String> dnsQuerys = getDNSQuerys();
                 for (String query : dnsQuerys) {
                     
@@ -301,7 +302,7 @@ class Monitor implements Runnable, IExtensionStateListener {
                 //removing payloads 
                 for (int i=0; i<this.requestsPayloads.size(); i++) {
                     long age = (long) requestsPayloads.get(i)[2];
-                    if ((System.currentTimeMillis() - age) > aliveTime) {
+                    if ((time - age) > aliveTime) {
                         requestsPayloads.remove(i);
                         i--;
                     }
